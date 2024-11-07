@@ -27,22 +27,19 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
 import org.apache.druid.common.guava.FutureUtils;
-import org.apache.druid.discovery.BrokerClient;
 import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.java.util.common.Pair;
 import org.apache.druid.java.util.common.StringUtils;
 import org.apache.druid.java.util.common.concurrent.Execs;
 import org.apache.druid.java.util.common.logger.Logger;
-import org.apache.druid.java.util.http.client.Request;
+import org.apache.druid.sql.client.BrokerClient;
 import org.apache.druid.sql.http.ResultFormat;
 import org.apache.druid.sql.http.SqlQuery;
 import org.apache.druid.timeline.DataSegment;
-import org.jboss.netty.handler.codec.http.HttpMethod;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
 
 import javax.annotation.Nullable;
-import javax.ws.rs.core.MediaType;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -91,46 +88,24 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
   private final BrokerClient brokerClient;
   private final ObjectMapper objectMapper;
   // Map of version vs latest load status.
-  private final AtomicReference<VersionLoadStatus> versionLoadStatusReference;
-  private final String datasource;
-  private final String versionsConditionString;
-  private final int totalSegmentsGenerated;
-  private final boolean doWait;
-  // since live reports fetch the value in another thread, we need to use AtomicReference
-  private final AtomicReference<SegmentLoadWaiterStatus> status;
-
-  private final ListeningExecutorService executorService;
+  private final AtomicReference<VersionLoadStatus> versionLoadStatus;
+  private final ListeningExecutorService exec;
+  private final String dataSource;
+  private final Set<DataSegment> segments;
 
   public SegmentLoadStatusFetcher(
       BrokerClient brokerClient,
       ObjectMapper objectMapper,
-      String queryId,
-      String datasource,
-      Set<DataSegment> dataSegments,
-      boolean doWait
+      String dataSource,
+      Set<DataSegment> segments
   )
   {
     this.brokerClient = brokerClient;
     this.objectMapper = objectMapper;
-    this.datasource = datasource;
-    this.versionsConditionString = createVersionCondition(dataSegments);
-    this.totalSegmentsGenerated = dataSegments.size();
-    this.versionLoadStatusReference = new AtomicReference<>(new VersionLoadStatus(0, 0, 0, 0, totalSegmentsGenerated));
-    this.status = new AtomicReference<>(new SegmentLoadWaiterStatus(
-        State.INIT,
-        null,
-        0,
-        totalSegmentsGenerated,
-        0,
-        0,
-        0,
-        0,
-        totalSegmentsGenerated
-    ));
-    this.doWait = doWait;
-    this.executorService = MoreExecutors.listeningDecorator(
-        Execs.singleThreaded(StringUtils.encodeForFormat(queryId) + "-segment-load-waiter-%d")
-    );
+    this.dataSource = dataSource;
+    this.segments = segments;
+    this.versionLoadStatus = new AtomicReference<>(null);
+    this.exec = MoreExecutors.listeningDecorator(Execs.singleThreaded("segment-load-status-fetcher-%d"));
   }
 
   /**
@@ -147,10 +122,10 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
     final DateTime startTime = DateTimes.nowUtc();
     final AtomicReference<Boolean> hasAnySegmentBeenLoaded = new AtomicReference<>(false);
     try {
-      FutureUtils.getUnchecked(executorService.submit(() -> {
+      FutureUtils.getUnchecked(exec.submit(() -> {
         long lastLogMillis = -TimeUnit.MINUTES.toMillis(1);
         try {
-          while (!(hasAnySegmentBeenLoaded.get() && versionLoadStatusReference.get().isLoadingComplete())) {
+          while (!(hasAnySegmentBeenLoaded.get() && versionLoadStatus.get().isLoadingComplete())) {
             // Check the timeout and exit if exceeded.
             long runningMillis = new Interval(startTime, DateTimes.nowUtc()).toDurationMillis();
             if (runningMillis > TIMEOUT_DURATION_MILLIS) {
@@ -167,16 +142,16 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
               lastLogMillis = runningMillis;
               log.info(
                   "Fetching segment load status for datasource[%s] from broker",
-                  datasource
+                  dataSource
               );
             }
 
             // Fetch the load status from the broker
             VersionLoadStatus loadStatus = fetchLoadStatusFromBroker();
-            versionLoadStatusReference.set(loadStatus);
+            versionLoadStatus.set(loadStatus);
             hasAnySegmentBeenLoaded.set(hasAnySegmentBeenLoaded.get() || loadStatus.getUsedSegments() > 0);
 
-            if (!(hasAnySegmentBeenLoaded.get() && versionLoadStatusReference.get().isLoadingComplete())) {
+            if (!(hasAnySegmentBeenLoaded.get() && versionLoadStatus.get().isLoadingComplete())) {
               // Update the status.
               updateStatus(State.WAITING, startTime);
               // Sleep for a bit before checking again.
@@ -191,7 +166,7 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
           return;
         }
         // Update the status.
-        log.info("Segment loading completed for datasource[%s]", datasource);
+        log.info("Segment loading completed for datasource[%s]", dataSource);
         updateStatus(State.SUCCESS, startTime);
       }), true);
     }
@@ -200,35 +175,34 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
       updateStatus(State.FAILED, startTime);
     }
     finally {
-      executorService.shutdownNow();
-    }
-  }
-  private void waitIfNeeded(long waitTimeMillis) throws Exception
-  {
-    if (doWait) {
-      Thread.sleep(waitTimeMillis);
+      exec.shutdownNow();
     }
   }
 
+  private void waitIfNeeded(long waitTimeMillis) throws Exception
+  {
+    Thread.sleep(waitTimeMillis);
+  }
+
   /**
-   * Updates the {@link #status} with the latest details based on {@link #versionLoadStatusReference}
+   * Updates the {@link #status} with the latest details based on {@link #versionLoadStatus}
    */
   private void updateStatus(State state, DateTime startTime)
   {
     long runningMillis = new Interval(startTime, DateTimes.nowUtc()).toDurationMillis();
-    VersionLoadStatus versionLoadStatus = versionLoadStatusReference.get();
-    status.set(
-        new SegmentLoadWaiterStatus(
-            state,
-            startTime,
-            runningMillis,
-            totalSegmentsGenerated,
-            versionLoadStatus.getUsedSegments(),
-            versionLoadStatus.getPrecachedSegments(),
-            versionLoadStatus.getOnDemandSegments(),
-            versionLoadStatus.getPendingSegments(),
-            versionLoadStatus.getUnknownSegments()
-        )
+    VersionLoadStatus versionLoadStatus = this.versionLoadStatus.get();
+    // Update the status.
+    log.info(
+        "Segment load status for datasource[%s] - state[%s], running time[%d], total segments[%d], used segments[%d], precached segments[%d], on demand segments[%d], pending segments[%d], unknown segments[%d]",
+        dataSource,
+        state,
+        runningMillis,
+        segments.size(),
+        versionLoadStatus.getUsedSegments(),
+        versionLoadStatus.getPrecachedSegments(),
+        versionLoadStatus.getOnDemandSegments(),
+        versionLoadStatus.getPendingSegments(),
+        versionLoadStatus.getUnknownSegments()
     );
   }
 
@@ -238,54 +212,29 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
    */
   private VersionLoadStatus fetchLoadStatusFromBroker() throws Exception
   {
-    Request request = brokerClient.makeRequest(HttpMethod.POST, "/druid/v2/sql/");
-    SqlQuery sqlQuery = new SqlQuery(StringUtils.format(LOAD_QUERY, datasource, versionsConditionString),
-                                     ResultFormat.OBJECTLINES,
-                                     false, false, false, null, null
+    final String intervalCondition = StringUtils.format(
+        "start = TIMESTAMP '%s' AND end = TIMESTAMP '%s'",
+        segments.iterator().next().getInterval().getStart(),
+        segments.iterator().next().getInterval().getEnd()
     );
-    request.setContent(MediaType.APPLICATION_JSON, objectMapper.writeValueAsBytes(sqlQuery));
-    String response = brokerClient.sendQuery(request);
 
-    if (response == null) {
-      // Unable to query broker
-      return new VersionLoadStatus(0, 0, 0, 0, totalSegmentsGenerated);
-    } else if (response.trim().isEmpty()) {
-      // If no segments are returned for a version, all segments have been dropped by a drop rule.
-      return new VersionLoadStatus(0, 0, 0, 0, 0);
-    } else {
-      return objectMapper.readValue(response, VersionLoadStatus.class);
-    }
-  }
+    final String query = StringUtils.format(LOAD_QUERY, dataSource, intervalCondition);
+    
+    SqlQuery sqlQuery = new SqlQuery(query, null, ResultFormat.ARRAY, false, false, false, null);
+    Map<String, Object> resultMap = (Map<String, Object>) brokerClient.submitSqlTask(sqlQuery)
+        .get()
+        .getResults()
+        .get(0);
 
-  /**
-   * Takes a list of segments and creates the condition for the broker query. Directly creates a string to avoid
-   * computing it repeatedly.
-   */
-  private static String createVersionCondition(Set<DataSegment> dataSegments)
-  {
-    // Creates a map of version to earliest and latest partition numbers created. These would be contiguous since the task
-    // holds the lock.
-    Map<String, Pair<Integer, Integer>> versionsVsPartitionNumberRangeMap = new HashMap<>();
-
-    dataSegments.forEach(segment -> {
-      final String version = segment.getVersion();
-      final int partitionNum = segment.getId().getPartitionNum();
-      versionsVsPartitionNumberRangeMap.computeIfPresent(version, (k, v) -> Pair.of(
-          partitionNum < v.lhs ? partitionNum : v.lhs,
-          partitionNum > v.rhs ? partitionNum : v.rhs
-      ));
-      versionsVsPartitionNumberRangeMap.computeIfAbsent(version, k -> Pair.of(partitionNum, partitionNum));
-    });
-
-    // Create a condition for each version / partition
-    List<String> versionConditionList = new ArrayList<>();
-    for (Map.Entry<String, Pair<Integer, Integer>> stringPairEntry : versionsVsPartitionNumberRangeMap.entrySet()) {
-      Pair<Integer, Integer> pair = stringPairEntry.getValue();
-      versionConditionList.add(
-          StringUtils.format("(version = '%s' AND partition_num BETWEEN %s AND %s)", stringPairEntry.getKey(), pair.lhs, pair.rhs)
-      );
-    }
-    return String.join(" OR ", versionConditionList);
+    final VersionLoadStatus status = new VersionLoadStatus(
+        ((Number) resultMap.get("usedSegments")).intValue(),
+        ((Number) resultMap.get("precachedSegments")).intValue(),
+        ((Number) resultMap.get("onDemandSegments")).intValue(),
+        ((Number) resultMap.get("pendingSegments")).intValue(),
+        ((Number) resultMap.get("unknownSegments")).intValue(),
+        DateTimes.nowUtc()
+    );
+    return status;
   }
 
   /**
@@ -293,14 +242,24 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
    */
   public SegmentLoadWaiterStatus status()
   {
-    return status.get();
+    return new SegmentLoadWaiterStatus(
+        State.INIT,
+        null,
+        0,
+        segments.size(),
+        versionLoadStatus.get().getUsedSegments(),
+        versionLoadStatus.get().getPrecachedSegments(),
+        versionLoadStatus.get().getOnDemandSegments(),
+        versionLoadStatus.get().getPendingSegments(),
+        versionLoadStatus.get().getUnknownSegments()
+    );
   }
 
   @Override
   public void close()
   {
     try {
-      executorService.shutdownNow();
+      exec.shutdownNow();
     }
     catch (Throwable suppressed) {
       log.warn(suppressed, "Error shutting down SegmentLoadStatusFetcher");
@@ -438,6 +397,7 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
     private final int onDemandSegments;
     private final int pendingSegments;
     private final int unknownSegments;
+    private final DateTime timestamp;
 
     @JsonCreator
     public VersionLoadStatus(
@@ -445,7 +405,8 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
         @JsonProperty("precachedSegments") int precachedSegments,
         @JsonProperty("onDemandSegments") int onDemandSegments,
         @JsonProperty("pendingSegments") int pendingSegments,
-        @JsonProperty("unknownSegments") int unknownSegments
+        @JsonProperty("unknownSegments") int unknownSegments,
+        @JsonProperty("timestamp") DateTime timestamp
     )
     {
       this.usedSegments = usedSegments;
@@ -453,6 +414,7 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
       this.onDemandSegments = onDemandSegments;
       this.pendingSegments = pendingSegments;
       this.unknownSegments = unknownSegments;
+      this.timestamp = timestamp;
     }
 
     @JsonProperty
@@ -483,6 +445,12 @@ public class SegmentLoadStatusFetcher implements AutoCloseable
     public int getUnknownSegments()
     {
       return unknownSegments;
+    }
+
+    @JsonProperty
+    public DateTime getTimestamp()
+    {
+      return timestamp;
     }
 
     @JsonIgnore

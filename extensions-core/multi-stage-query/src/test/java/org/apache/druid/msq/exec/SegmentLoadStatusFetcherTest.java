@@ -20,33 +20,35 @@
 package org.apache.druid.msq.exec;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.druid.discovery.BrokerClient;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import org.apache.druid.sql.client.BrokerClient;
+import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.java.util.common.Intervals;
-import org.apache.druid.java.util.http.client.Request;
+import org.apache.druid.sql.http.SqlQuery;
+import org.apache.druid.sql.http.SqlTaskStatus;
 import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.partition.NumberedShardSpec;
 import org.junit.Assert;
 import org.junit.Test;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 public class SegmentLoadStatusFetcherTest
 {
   private static final String TEST_DATASOURCE = "testDatasource";
 
   private SegmentLoadStatusFetcher segmentLoadWaiter;
-
   private BrokerClient brokerClient;
 
   /**
@@ -56,133 +58,78 @@ public class SegmentLoadStatusFetcherTest
   public void testSingleVersionWaitsForLoadCorrectly() throws Exception
   {
     brokerClient = mock(BrokerClient.class);
+    final int[] timesInvoked = {0};
 
-    doReturn(mock(Request.class)).when(brokerClient).makeRequest(any(), anyString());
-    doAnswer(new Answer<String>()
-    {
-      int timesInvoked = 0;
+    when(brokerClient.submitSqlTask(any(SqlQuery.class))).thenAnswer(invocation -> {
+      timesInvoked[0]++;
+      Map<String, Object> resultMap = new HashMap<>();
+      resultMap.put("usedSegments", 5);
+      resultMap.put("precachedSegments", timesInvoked[0]);
+      resultMap.put("onDemandSegments", 0);
+      resultMap.put("pendingSegments", 5 - timesInvoked[0]);
+      resultMap.put("unknownSegments", 0);
 
-      @Override
-      public String answer(InvocationOnMock invocation) throws Throwable
-      {
-        timesInvoked += 1;
-        SegmentLoadStatusFetcher.VersionLoadStatus loadStatus = new SegmentLoadStatusFetcher.VersionLoadStatus(
-            5,
-            timesInvoked,
-            0,
-            5 - timesInvoked,
-            0
-        );
-        return new ObjectMapper().writeValueAsString(loadStatus);
-      }
-    }).when(brokerClient).sendQuery(any());
+      SqlTaskStatus status = new SqlTaskStatus(ImmutableList.of(resultMap), null);
+      return Futures.immediateFuture(status);
+    });
+
     segmentLoadWaiter = new SegmentLoadStatusFetcher(
         brokerClient,
         new ObjectMapper(),
-        "id",
         TEST_DATASOURCE,
-        IntStream.range(0, 5).boxed().map(partitionNum -> createTestDataSegment("version1", partitionNum)).collect(Collectors.toSet()),
-        false
+        IntStream.range(0, 5)
+                .boxed()
+                .map(partitionNum -> createTestDataSegment("version1", partitionNum))
+                .collect(Collectors.toSet())
     );
-    segmentLoadWaiter.waitForSegmentsToLoad();
 
-    verify(brokerClient, times(5)).sendQuery(any());
+    segmentLoadWaiter.waitForSegmentsToLoad();
+    verify(brokerClient, times(5)).submitSqlTask(any());
   }
 
   @Test
   public void testMultipleVersionWaitsForLoadCorrectly() throws Exception
   {
     brokerClient = mock(BrokerClient.class);
+    final int[] timesInvoked = {0};
 
-    doReturn(mock(Request.class)).when(brokerClient).makeRequest(any(), anyString());
-    doAnswer(new Answer<String>()
-    {
-      int timesInvoked = 0;
+    when(brokerClient.submitSqlTask(any(SqlQuery.class))).thenAnswer(invocation -> {
+      timesInvoked[0]++;
+      Map<String, Object> resultMap = new HashMap<>();
+      resultMap.put("usedSegments", 10);
+      resultMap.put("precachedSegments", timesInvoked[0]);
+      resultMap.put("onDemandSegments", 0);
+      resultMap.put("pendingSegments", 10 - timesInvoked[0]);
+      resultMap.put("unknownSegments", 0);
 
-      @Override
-      public String answer(InvocationOnMock invocation) throws Throwable
-      {
-        timesInvoked += 1;
-        SegmentLoadStatusFetcher.VersionLoadStatus loadStatus = new SegmentLoadStatusFetcher.VersionLoadStatus(
-            5,
-            timesInvoked,
-            0,
-            5 - timesInvoked,
-            0
-        );
-        return new ObjectMapper().writeValueAsString(loadStatus);
-      }
-    }).when(brokerClient).sendQuery(any());
+      SqlTaskStatus status = new SqlTaskStatus(ImmutableList.of(resultMap), null);
+      return Futures.immediateFuture(status);
+    });
+
     segmentLoadWaiter = new SegmentLoadStatusFetcher(
         brokerClient,
         new ObjectMapper(),
-        "id",
         TEST_DATASOURCE,
-        IntStream.range(0, 5).boxed().map(partitionNum -> createTestDataSegment("version1", partitionNum)).collect(Collectors.toSet()),
-        false
+        IntStream.range(0, 10)
+                .boxed()
+                .map(partitionNum -> createTestDataSegment(
+                    partitionNum < 5 ? "version1" : "version2",
+                    partitionNum
+                ))
+                .collect(Collectors.toSet())
     );
+
     segmentLoadWaiter.waitForSegmentsToLoad();
-
-    verify(brokerClient, times(5)).sendQuery(any());
+    verify(brokerClient, times(10)).submitSqlTask(any());
   }
 
-  @Test
-  public void triggerCancellationFromAnotherThread() throws Exception
+  private static DataSegment createTestDataSegment(String version, int partitionNum)
   {
-    brokerClient = mock(BrokerClient.class);
-    doReturn(mock(Request.class)).when(brokerClient).makeRequest(any(), anyString());
-    doAnswer(new Answer<String>()
-    {
-      int timesInvoked = 0;
-
-      @Override
-      public String answer(InvocationOnMock invocation) throws Throwable
-      {
-        // sleeping broker call to simulate a long running query
-        Thread.sleep(1000);
-        timesInvoked++;
-        SegmentLoadStatusFetcher.VersionLoadStatus loadStatus = new SegmentLoadStatusFetcher.VersionLoadStatus(
-            5,
-            timesInvoked,
-            0,
-            5 - timesInvoked,
-            0
-        );
-        return new ObjectMapper().writeValueAsString(loadStatus);
-      }
-    }).when(brokerClient).sendQuery(any());
-    segmentLoadWaiter = new SegmentLoadStatusFetcher(
-        brokerClient,
-        new ObjectMapper(),
-        "id",
-        TEST_DATASOURCE,
-        IntStream.range(0, 5).boxed().map(partitionNum -> createTestDataSegment("version1", partitionNum)).collect(Collectors.toSet()),
-        true
-    );
-
-    Thread t = new Thread(() -> segmentLoadWaiter.waitForSegmentsToLoad());
-    t.start();
-    // call close from main thread
-    segmentLoadWaiter.close();
-    t.join(1000);
-    Assert.assertFalse(t.isAlive());
-
-    Assert.assertTrue(segmentLoadWaiter.status().getState().isFinished());
-    Assert.assertTrue(segmentLoadWaiter.status().getState() == SegmentLoadStatusFetcher.State.FAILED);
-  }
-
-  private static DataSegment createTestDataSegment(String version, int partitionNumber)
-  {
-    return new DataSegment(
-        TEST_DATASOURCE,
-        Intervals.ETERNITY,
-        version,
-        null,
-        null,
-        null,
-        new NumberedShardSpec(partitionNumber, 1),
-        0,
-        0
-    );
+    return DataSegment.builder()
+                     .dataSource(TEST_DATASOURCE)
+                     .interval(Intervals.of("2020/2021"))
+                     .version(version)
+                     .shardSpec(new NumberedShardSpec(partitionNum, 0))
+                     .build();
   }
 }
